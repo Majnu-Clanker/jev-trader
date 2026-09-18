@@ -10,8 +10,12 @@
  *   2. quote + candles + positions from the broker
  *   3. local indicators
  *   4. deterministic exits first (stop-loss / target / max-loss kill switch)
- *   5. build Jev state -> ask Jev -> BUY / SELL / HOLD
+ *   5. build Jev state -> ask Jev -> BUY / SHORT / SELL / COVER / HOLD
  *   6. risk pre-trade checks -> execute (paper ledger or live order)
+ *
+ * Session P&L accumulates EVERYTHING that happens during the run —
+ * realized P&L on every closing fill plus live unrealized P&L —
+ * in both paper and live mode.
  */
 import {
   EXCHANGE,
@@ -33,11 +37,14 @@ import { PaperLedger } from "./paper.js";
 const $ = (id) => document.getElementById(id);
 const broker = BrokerFactory.create("kite-session");
 
+/** action -> broker transaction type */
+const TX = { BUY: "BUY", SHORT: "SELL", SELL: "SELL", COVER: "BUY" };
+
 let settings = null;
 let risk = null;
 let paper = new PaperLedger();
 /** live-mode stop/target memory: symbol -> {stopPrice, targetPrice} */
-let liveStops = new Map();
+let liveRisk = new Map();
 let running = false;
 let timerId = null;
 let recentDecisions = [];
@@ -110,20 +117,20 @@ async function refreshConnection() {
 async function getOpenPosition(symbol, ltp) {
   if (settings.paperMode) {
     const p = paper.getPosition(symbol);
-    if (!p) return null;
+    if (!p || p.qty === 0) return null;
     return {
-      side: "LONG",
-      qty: p.qty,
+      side: p.qty > 0 ? "LONG" : "SHORT",
+      qty: Math.abs(p.qty),
       avgPrice: p.avgPrice,
-      unrealizedPnl: (ltp - p.avgPrice) * p.qty,
+      unrealizedPnl: (ltp - p.avgPrice) * p.qty, // signed qty: correct for shorts too
       stopPrice: p.stopPrice,
       targetPrice: p.targetPrice,
     };
   }
   const positions = await broker.getPositions();
   const p = positions.find((x) => x.symbol === symbol && x.exchange === EXCHANGE);
-  if (!p) return null;
-  const stops = liveStops.get(symbol) || {};
+  if (!p || p.quantity === 0) return null;
+  const stops = liveRisk.get(symbol) || {};
   return {
     side: p.quantity > 0 ? "LONG" : "SHORT",
     qty: Math.abs(p.quantity),
@@ -134,35 +141,39 @@ async function getOpenPosition(symbol, ltp) {
   };
 }
 
-async function executeOrder({ side, qty, price, stopPrice = null, targetPrice = null }) {
+/**
+ * @param {{action:"BUY"|"SHORT"|"SELL"|"COVER", qty:number, price:number, stopPrice?:number|null, targetPrice?:number|null}} o
+ */
+async function executeOrder({ action, qty, price, stopPrice = null, targetPrice = null }) {
   const symbol = settings.symbol;
   if (settings.paperMode) {
-    const r = paper.execute({ symbol, side, qty, price, stopPrice, targetPrice });
+    const r = paper.execute({ symbol, side: TX[action], qty, price, stopPrice, targetPrice });
     sessionTrades++;
     sessionRealized = paper.realizedPnl;
     sessionSpend = paper.spendUsed;
-    log(`PAPER ${side} ${qty} ${symbol} @ ₹${price.toFixed(2)}`, "ok");
+    log(`PAPER ${action} ${qty} ${symbol} @ ₹${price.toFixed(2)}`, "ok");
     return r;
   }
+  // live: capture the pre-trade position so closing fills book realized P&L
+  const before = await getOpenPosition(symbol, price).catch(() => null);
   const r = await broker.placeOrder({
     exchange: EXCHANGE,
     symbol,
-    transactionType: side,
+    transactionType: TX[action],
     quantity: qty,
     product: "MIS",
     orderType: "MARKET",
   });
   sessionTrades++;
-  if (side === "BUY") {
-    sessionSpend += price * qty;
-    liveStops.set(symbol, { stopPrice, targetPrice });
-  } else {
-    // approximate realized P&L at LTP for session accounting
-    const pos = await getOpenPosition(symbol, price).catch(() => null);
-    liveStops.delete(symbol);
-    void pos;
+  sessionSpend += price * qty;
+  if (action === "BUY" || action === "SHORT") {
+    liveRisk.set(symbol, { stopPrice, targetPrice });
+  } else if (before && before.qty > 0) {
+    const dir = before.side === "LONG" ? 1 : -1;
+    sessionRealized += (price - before.avgPrice) * qty * dir; // fill approximated at LTP
+    liveRisk.delete(symbol);
   }
-  log(`LIVE ${side} ${qty} ${symbol} — order ${r.orderId}`, "ok");
+  log(`LIVE ${action} ${qty} ${symbol} — order ${r.orderId}`, "ok");
   return r;
 }
 
@@ -212,28 +223,38 @@ async function tick() {
     };
 
     const position = await getOpenPosition(symbol, quote.lastPrice);
-    const hasPosition = !!position && position.side === "LONG";
+    const positionSide = position ? position.side : "FLAT";
 
     // 1) deterministic exits before Jev
-    if (hasPosition) {
+    if (position) {
       const hard = risk.checkHardExit({
         ltp: quote.lastPrice,
+        side: positionSide,
         stopPrice: position.stopPrice,
         targetPrice: position.targetPrice,
       });
       if (hard) {
-        await executeOrder({ side: "SELL", qty: position.qty, price: quote.lastPrice });
-        log(`${hard === "STOP_LOSS" ? "Stop-loss" : "Target"} hit — sold ${position.qty} @ ₹${quote.lastPrice.toFixed(2)}`, "err");
+        const exitAction = positionSide === "LONG" ? "SELL" : "COVER";
+        await executeOrder({ action: exitAction, qty: position.qty, price: quote.lastPrice });
+        log(
+          `${hard === "STOP_LOSS" ? "Stop-loss" : "Target"} hit — ${exitAction === "SELL" ? "sold" : "covered"} ` +
+            `${position.qty} @ ₹${quote.lastPrice.toFixed(2)}`,
+          "err"
+        );
         updateStatus(quote, null);
         return;
       }
-      if (risk.checkKillSwitch({ realizedPnl: sessionRealized, unrealizedPnl: position.unrealizedPnl })) {
-        await executeOrder({ side: "SELL", qty: position.qty, price: quote.lastPrice });
-        halt(`Max-loss kill switch tripped (₹${settings.maxLoss}). Position squared off.`);
-        return;
+    }
+    const unreal = position ? position.unrealizedPnl : 0;
+    if (risk.checkKillSwitch({ realizedPnl: sessionRealized, unrealizedPnl: unreal })) {
+      if (position) {
+        await executeOrder({
+          action: positionSide === "LONG" ? "SELL" : "COVER",
+          qty: position.qty,
+          price: quote.lastPrice,
+        });
       }
-    } else if (risk.checkKillSwitch({ realizedPnl: sessionRealized, unrealizedPnl: 0 })) {
-      halt(`Max-loss kill switch tripped (₹${settings.maxLoss}).`);
+      halt(`Max-loss kill switch tripped (₹${settings.maxLoss}). Position squared off.`);
       return;
     }
 
@@ -249,7 +270,14 @@ async function tick() {
       candles,
       ind,
       position: position
-        ? { side: position.side, qty: position.qty, avgPrice: position.avgPrice, unrealizedPnl: position.unrealizedPnl, stopPrice: position.stopPrice, targetPrice: position.targetPrice }
+        ? {
+            side: position.side,
+            qty: position.qty,
+            avgPrice: position.avgPrice,
+            unrealizedPnl: position.unrealizedPnl,
+            stopPrice: position.stopPrice,
+            targetPrice: position.targetPrice,
+          }
         : { side: "FLAT", qty: 0, avgPrice: 0, unrealizedPnl: 0, stopPrice: null, targetPrice: null },
       session: {
         trades: sessionTrades,
@@ -261,12 +289,13 @@ async function tick() {
       risk: { level: settings.riskLevel, ...risk.describe() },
       mode: settings.paperMode ? "PAPER" : "LIVE",
       recentDecisions,
+      shortEnabled: settings.shortEnabled,
     });
 
-    const decision = await askJev({ apiKey: settings.jevApiKey, state, hasPosition });
+    const decision = await askJev({ apiKey: settings.jevApiKey, state, positionSide, shortEnabled: settings.shortEnabled });
     if (!decision) {
       log("Jev unreachable/indecisive — HOLD", "jev");
-      pushDecision("HOLD", null, hasPosition ? "long" : "flat");
+      pushDecision("HOLD", null, positionSide);
       updateStatus(quote, position);
       return;
     }
@@ -276,26 +305,32 @@ async function tick() {
       "jev"
     );
 
-    // 3) act
-    if (decision.action === "BUY" && !hasPosition) {
+    // 3) act — SHORT entries additionally require the user's explicit opt-in
+    const wantShort = decision.action === "SHORT" && settings.shortEnabled;
+    if ((decision.action === "BUY" || wantShort) && positionSide === "FLAT") {
+      const entrySide = decision.action === "BUY" ? "LONG" : "SHORT";
       const qty = risk.sizeQuantity(quote.lastPrice);
       const blocked = risk.checkPreTrade({ trades: sessionTrades, spendUsed: sessionSpend, qty, ltp: quote.lastPrice });
       if (blocked) {
-        log(`BUY blocked by risk: ${blocked}`, "err");
+        log(`${decision.action} blocked by risk: ${blocked}`, "err");
       } else {
         await executeOrder({
-          side: "BUY",
+          action: decision.action,
           qty,
           price: quote.lastPrice,
-          stopPrice: risk.stopPrice(quote.lastPrice),
-          targetPrice: risk.targetPrice(quote.lastPrice),
+          stopPrice: risk.stopPrice(quote.lastPrice, entrySide),
+          targetPrice: risk.targetPrice(quote.lastPrice, entrySide),
         });
       }
-    } else if (decision.action === "SELL" && hasPosition) {
-      await executeOrder({ side: "SELL", qty: position.qty, price: quote.lastPrice });
+    } else if (decision.action === "SELL" && positionSide === "LONG") {
+      await executeOrder({ action: "SELL", qty: position.qty, price: quote.lastPrice });
+    } else if (decision.action === "COVER" && positionSide === "SHORT") {
+      await executeOrder({ action: "COVER", qty: position.qty, price: quote.lastPrice });
+    } else if (decision.action === "SHORT" && positionSide === "FLAT") {
+      log("SHORT signal ignored — short selling is turned off", "err");
     }
 
-    pushDecision(decision.action, decision.confidence, hasPosition ? "long" : "flat");
+    pushDecision(decision.action, decision.confidence, positionSide);
     updateStatus(quote, await getOpenPosition(symbol, quote.lastPrice));
   } catch (e) {
     if (e.code === "NOT_AUTHENTICATED") {
@@ -306,8 +341,8 @@ async function tick() {
   }
 }
 
-function pushDecision(action, conf, pos) {
-  const label = `${istTimeStr().slice(0, 5)} ${action} (${pos}${conf !== null ? `, conf ${conf.toFixed(2)}` : ""})`;
+function pushDecision(action, conf, posSide) {
+  const label = `${istTimeStr().slice(0, 5)} ${action} (${posSide.toLowerCase()}${conf !== null ? `, conf ${conf.toFixed(2)}` : ""})`;
   recentDecisions.push(label);
   if (recentDecisions.length > 10) recentDecisions.shift();
   const d = $("lastDecision");
@@ -327,7 +362,7 @@ async function updateStatus(quote, position) {
   $("pickedLtp").textContent = quote ? `@ ₹${quote.lastPrice.toFixed(2)}` : "";
   const pos = position ?? (await getOpenPosition(settings.symbol, quote?.lastPrice ?? 0).catch(() => null));
   if (pos) {
-    $("stPosition").textContent = `LONG ${pos.qty} @ ₹${pos.avgPrice.toFixed(2)}`;
+    $("stPosition").textContent = `${pos.side} ${pos.qty} @ ₹${pos.avgPrice.toFixed(2)}`;
     const u = fmtPnl(pos.unrealizedPnl);
     $("stUnreal").innerHTML = `<span class="${u.cls}">${u.s}</span>`;
   } else {
@@ -363,7 +398,7 @@ async function start() {
     riskLevel: settings.riskLevel,
   });
   paper.reset();
-  liveStops = new Map();
+  liveRisk = new Map();
   recentDecisions = [];
   sessionRealized = 0;
   sessionSpend = 0;
@@ -398,7 +433,7 @@ function stop() {
 }
 
 function setControlsEnabled(on) {
-  for (const id of ["jevKey", "saveKeyBtn", "symbolInput", "spendLimit", "maxLoss", "intervalSel", "riskSel", "paperToggle"]) {
+  for (const id of ["jevKey", "saveKeyBtn", "symbolInput", "spendLimit", "maxLoss", "intervalSel", "riskSel", "paperToggle", "shortToggle"]) {
     $(id).disabled = !on;
   }
 }
@@ -413,6 +448,7 @@ async function init() {
   $("intervalSel").value = settings.interval;
   $("riskSel").value = settings.riskLevel;
   $("paperToggle").checked = settings.paperMode;
+  $("shortToggle").checked = settings.shortEnabled;
   $("pickedSymbol").textContent = settings.symbol;
   updateModeBadge();
 
@@ -438,6 +474,10 @@ async function init() {
   $("paperToggle").onchange = async () => {
     settings = await saveSettings({ paperMode: $("paperToggle").checked });
     updateModeBadge();
+  };
+  $("shortToggle").onchange = async () => {
+    settings = await saveSettings({ shortEnabled: $("shortToggle").checked });
+    log(`Short selling ${settings.shortEnabled ? "ENABLED" : "disabled"}`);
   };
 
   // symbol search

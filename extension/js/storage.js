@@ -9,6 +9,7 @@ export const DEFAULT_SETTINGS = {
   riskLevel: "medium",
   maxLoss: 2000, // ₹ — kill switch
   paperMode: true, // ON by default; toggle for live trading
+  shortEnabled: false, // OFF by default; user must explicitly allow short selling
 };
 
 export async function loadSettings() {

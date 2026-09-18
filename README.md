@@ -54,9 +54,11 @@ The `state` text of each `/v1/systemone` request contains:
 The `questions` are `noul` (scored 0–1, ≥ 0.5 = yes):
 
 - **Flat → `enter_long`**: *"Should a LONG be opened right now at market price?"* — yes only on a clear bullish edge with favorable risk/reward.
+- **Flat → `enter_short`** *(only asked when the user explicitly enables short selling — off by default)*: *"Should a SHORT be opened right now at market price?"* — yes only on a clear bearish edge. When both fire, the stronger conviction wins.
 - **Long → `exit_long`**: *"Should the open LONG be closed right now at market price?"* — yes when the target is hit, momentum reversed, or risk demands it.
+- **Short → `exit_short`**: *"Should the open SHORT be covered right now at market price?"* — yes when the target is hit, momentum reversed up, or risk demands it.
 
-v1 is **long-only** intraday (MIS). Shorting is a deliberate scope cut — adding an `enter_short`/`exit_short` pair is the extension point.
+Intraday (MIS) on NSE equities. Shorting is strictly opt-in: an "Allow short selling" checkbox, off by default, and the bot ignores any SHORT signal while it's off.
 
 ## Architecture
 

@@ -7,6 +7,9 @@
  *   - Hard exits: stop-loss / target, evaluated locally BEFORE asking Jev.
  *   - Kill switch: session P&L (realized + unrealized) <= -maxLoss ->
  *     square off everything and halt the bot until manually restarted.
+ *
+ * Sides: "LONG" | "SHORT". Stops/targets mirror for shorts
+ * (a short's stop sits ABOVE entry, its target BELOW).
  */
 import { RISK_PRESETS } from "./config.js";
 
@@ -31,12 +34,14 @@ export class RiskManager {
     return Math.max(1, Math.floor(this.maxPositionValue() / ltp));
   }
 
-  stopPrice(entryPrice) {
-    return entryPrice * (1 - this.preset.stopPct);
+  /** @param {"LONG"|"SHORT"} side */
+  stopPrice(entryPrice, side) {
+    return side === "SHORT" ? entryPrice * (1 + this.preset.stopPct) : entryPrice * (1 - this.preset.stopPct);
   }
 
-  targetPrice(entryPrice) {
-    return entryPrice * (1 + this.preset.targetPct);
+  /** @param {"LONG"|"SHORT"} side */
+  targetPrice(entryPrice, side) {
+    return side === "SHORT" ? entryPrice * (1 - this.preset.targetPct) : entryPrice * (1 + this.preset.targetPct);
   }
 
   /**
@@ -53,9 +58,15 @@ export class RiskManager {
 
   /**
    * Deterministic exits, checked before Jev is consulted.
+   * @param {{ltp:number, side:"LONG"|"SHORT", stopPrice:number|null, targetPrice:number|null}} t
    * @returns {"STOP_LOSS"|"TARGET"|null}
    */
-  checkHardExit({ ltp, stopPrice, targetPrice }) {
+  checkHardExit({ ltp, side, stopPrice, targetPrice }) {
+    if (side === "SHORT") {
+      if (stopPrice !== null && ltp >= stopPrice) return "STOP_LOSS";
+      if (targetPrice !== null && ltp <= targetPrice) return "TARGET";
+      return null;
+    }
     if (stopPrice !== null && ltp <= stopPrice) return "STOP_LOSS";
     if (targetPrice !== null && ltp >= targetPrice) return "TARGET";
     return null;
